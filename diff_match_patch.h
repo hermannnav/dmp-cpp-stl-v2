@@ -416,6 +416,7 @@ class diff_match_patch {
  private:
   static void diff_lineMode(string_t text1, string_t text2, clock_t deadline, Diffs& diffs) {
     // Scan the text on a line-by-line basis first.
+      //MARK: line comparison
     Lines linearray;
     diff_linesToChars(text1, text2, linearray);
 
@@ -433,38 +434,64 @@ class diff_match_patch {
     int count_insert = 0;
     string_t text_delete;
     string_t text_insert;
+      bool use_word_comparison = linearray.size() >= 10000;
+      function<void(Diffs &, string_t, string_t, clock_t)> comparisonFunc = nullptr;
+      if (use_word_comparison) {
+          //MARK: word comparison
+          comparisonFunc = [](Diffs &new_diffs, string_t text_delete, string_t text_insert, clock_t deadline) {
+              Lines wordarray;
+              diff_linesToWords(text_delete, text_insert, wordarray);
 
-    for (typename Diffs::iterator cur_diff = diffs.begin(); cur_diff != diffs.end(); ++cur_diff) {
-      switch ((*cur_diff).operation) {
-        case INSERT:
-          count_insert++;
-          text_insert += (*cur_diff).text;
-          break;
-        case DELETE:
-          count_delete++;
-          text_delete += (*cur_diff).text;
-          break;
-        case EQUAL:
-          // Upon reaching an equality, check for prior redundancies.
-          if (count_delete >= 1 && count_insert >= 1) {
-            // Delete the offending records and add the merged ones.
-            typename Diffs::iterator last = cur_diff;
-            std::advance(cur_diff, -(count_delete + count_insert));
-            cur_diff = diffs.erase(cur_diff, last);
+              diff_main(text_delete, text_insert, false, deadline, new_diffs);
 
-            Diffs new_diffs;
-            diff_main(text_delete, text_insert, false, deadline, new_diffs);
-            diffs.splice(cur_diff++, new_diffs);
-            --cur_diff;
-          }
-          count_insert = 0;
-          count_delete = 0;
-          text_delete.clear();
-          text_insert.clear();
-          break;
+              // Convert the diff back to original text.
+              diff_charsToLines(new_diffs, wordarray);
+              // Eliminate freak matches (e.g. blank lines)
+              diff_cleanupSemantic(new_diffs);
+          };
+      } else {
+          //MARK: char comparison
+          comparisonFunc = [](Diffs &new_diffs, string_t text_delete, string_t text_insert, clock_t deadline) {
+              diff_main(text_delete, text_insert, false, deadline, new_diffs);
+          };
       }
-    }
-    diffs.pop_back();  // Remove the dummy entry at the end.
+
+      for (typename Diffs::iterator cur_diff = diffs.begin(); cur_diff != diffs.end(); ++cur_diff) {
+        switch ((*cur_diff).operation) {
+          case INSERT:
+            count_insert++;
+            text_insert += (*cur_diff).text;
+            break;
+          case DELETE:
+            count_delete++;
+            text_delete += (*cur_diff).text;
+            break;
+          case EQUAL:
+            // Upon reaching an equality, check for prior redundancies.
+            if (count_delete >= 1 && count_insert >= 1) {
+              // Delete the offending records and add the merged ones.
+              typename Diffs::iterator last = cur_diff;
+              std::advance(cur_diff, -(count_delete + count_insert));
+              cur_diff = diffs.erase(cur_diff, last);
+
+              Diffs new_diffs;
+              comparisonFunc(new_diffs, text_delete, text_insert, deadline);
+              diffs.splice(cur_diff++, new_diffs);
+              --cur_diff;
+            }
+            count_insert = 0;
+            count_delete = 0;
+            text_delete.clear();
+            text_insert.clear();
+            break;
+        }
+      }
+      diffs.pop_back();  // Remove the dummy entry at the end.
+      
+      if (use_word_comparison) {
+          //somehow it word mode produces empty diff
+          diff_cleanupSemantic(diffs);
+      }
   }
 
   /**
@@ -489,7 +516,7 @@ class diff_match_patch {
     const int max_d = (text1_length + text2_length + 1) / 2;
     const int v_offset = max_d;
     const int v_length = 2 * max_d;
-    std::vector<int> v1(v_length, -1), 
+    std::vector<int> v1(v_length, -1),
                      v2(v_length, -1);
     v1[v_offset + 1] = 0;
     v2[v_offset + 1] = 0;
@@ -648,6 +675,23 @@ class diff_match_patch {
     for (typename std::map<LinePtr, size_t>::const_iterator i = lineHash.begin(); i != lineHash.end(); ++i)
       lineArray[(*i).second] = (*i).first;
   }
+    
+    static void diff_linesToWords(string_t &text1, string_t &text2, Lines& lineArray) {
+      std::map<LinePtr, size_t> lineHash;
+      lineArray.text1.swap(text1), lineArray.text2.swap(text2);
+      // e.g. linearray[4] == "Hello\n"
+      // e.g. linehash.get("Hello\n") == 4
+
+      // "\x00" is a valid character, but various debuggers don't like it.
+      // So we'll insert a junk entry to avoid generating a null character.
+
+      text1 = diff_linesToWordsMunge(lineArray.text1, lineHash);
+      text2 = diff_linesToWordsMunge(lineArray.text2, lineHash);
+
+      lineArray.resize(lineHash.size() + 1);
+      for (typename std::map<LinePtr, size_t>::const_iterator i = lineHash.begin(); i != lineHash.end(); ++i)
+        lineArray[(*i).second] = (*i).first;
+    }
 
   /**
    * Split a text into a list of pointers to strings.  Reduce the texts to a string of
@@ -671,6 +715,34 @@ class diff_match_patch {
     return chars;
   }
 
+    static string_t diff_linesToWordsMunge(const string_t &text, std::map<LinePtr, size_t> &lineHash) {
+      string_t chars;
+      // Walk the text, pulling out a substring for each line.
+      // text.split('\n') would would temporarily double our memory footprint.
+      // Modifying text would create many large strings to garbage collect.
+      typename string_t::size_type lineLen;
+      typename string_t::size_type lineLenTmp1;
+      typename string_t::size_type lineLenTmp2;
+
+      for (typename string_t::const_pointer lineStart = text.c_str(), textEnd = lineStart + text.size(); lineStart < textEnd; lineStart += lineLen + 1) {
+          
+        
+        lineLenTmp1 = next_token(text, traits::from_wchar(L' '), lineStart);
+        lineLenTmp2 = next_token(text, traits::from_wchar(L'\n'), lineStart);
+        lineLen = min(lineLenTmp1, lineLenTmp2);
+          
+        if (lineStart + lineLen == textEnd) {
+          --lineLen;
+          chars += (char_t)(*lineHash.insert(std::make_pair(LinePtr(lineStart, lineLen + 1), lineHash.size() + 1)).first).second;
+        } else {
+          chars += (char_t)(*lineHash.insert(std::make_pair(LinePtr(lineStart, lineLen), lineHash.size() + 1)).first).second;
+          chars += (char_t)(*lineHash.insert(std::make_pair(LinePtr(lineStart + lineLen, 1), lineHash.size() + 1)).first).second;
+        }
+          
+      }
+      return chars;
+    }
+    
   /**
    * Rehydrate the text in a diff from a string of line hashes to real lines of
    * text.
@@ -785,7 +857,7 @@ class diff_match_patch {
    * @param text2 Second string.
    * @param HalfMatchResult object, containing the prefix of text1, the
    *     suffix of text1, the prefix of text2, the suffix of text2 and the
-   *     common middle.  
+   *     common middle.
    * @return Boolean true if there was a match, false otherwise.
    */
  protected:
@@ -940,8 +1012,84 @@ class diff_match_patch {
     if (changes) {
       diff_cleanupMerge(diffs);
     }
-    diff_cleanupSemanticLossless(diffs);
-
+      
+    {
+        size_t prevDiffCount = diffs.size();
+        diff_cleanupSemanticLossless(diffs);
+        if (prevDiffCount != diffs.size()) {
+            //after diff_cleanupSemanticLossless(), there may have repeated operation., e.g. two consecutive DELETEs with two spaces "  ". So call diff_cleanupMerge() again
+            diff_cleanupMerge(diffs);
+        }
+    }
+    //cleanup space and \n
+    {
+        changes = false;
+        if ((cur_diff = diffs.begin()) != diffs.end()) {
+          bool needMerge = true;
+          for (typename Diffs::iterator prev_diff = cur_diff; ++cur_diff != diffs.end(); prev_diff = cur_diff) {
+            if ((*cur_diff).operation == EQUAL) {
+              string_t equality = (*cur_diff).text;
+              //TODO: space \n
+                
+                typename string_t::const_iterator p1 = equality.begin(), p2 = equality.end();
+                while (p1 != p2) {
+                    if (traits::to_wchar(*p1) == L'\n') {
+                        // \n
+                        if (traits::to_wchar(*(p1 + 1)) == L'\r') {
+                            ++p1;
+                        }
+                    } else if (traits::to_wchar(*p1) == L' ') {
+                        // space
+                    } else {
+                        needMerge = false;
+                        break;
+                    }
+                    ++p1;
+                }
+                
+                if (needMerge) {
+                    if ((*prev_diff).operation == INSERT) {
+                        (*prev_diff).text.append((*cur_diff).text);
+                        (*cur_diff).operation = DELETE;
+                        changes = true;
+                    } else if ((*prev_diff).operation == DELETE) {
+                        (*prev_diff).text.append((*cur_diff).text);
+                        (*cur_diff).operation = INSERT;
+                        changes = true;
+                    }
+                }
+                
+              if (++cur_diff == diffs.end()) break;
+            }
+          }
+        }
+        // Normalize the diff.
+        if (changes) {
+          diff_cleanupMerge(diffs);
+        }
+    }
+    
+    //empty ""
+//    {
+//        changes = false;
+//        if ((cur_diff = diffs.begin()) != diffs.end()) {
+//          bool needMerge = true;
+//          for (typename Diffs::iterator prev_diff = cur_diff; ++cur_diff != diffs.end(); prev_diff = cur_diff) {
+//            if ((*cur_diff).operation != EQUAL) {
+//              if((*cur_diff).text.length() == 0) {
+//                cur_diff = diffs.erase(cur_diff);
+//                  changes = true;
+//              }
+//                
+//              if (++cur_diff == diffs.end()) break;
+//            }
+//          }
+//        }
+//        // Normalize the diff.
+//        if (changes) {
+//          diff_cleanupMerge(diffs);
+//        }
+//    }
     // Find any overlaps between deletions and insertions.
     // e.g: <del>abcxxx</del><ins>xxxdef</ins>
     //   -> <del>abc</del>xxx<ins>def</ins>
@@ -1646,7 +1794,7 @@ class diff_match_patch {
     }
 
     // Initialise the alphabet.
-    std::map<char_t, int> s; 
+    std::map<char_t, int> s;
     match_alphabet(pattern, s);
 
     // Highest score beyond which we give up.
@@ -2419,7 +2567,7 @@ class diff_match_patch {
         c = traits::to_utf32(c, end, u);
         unsigned char* pt = utf8;
         if (u < 0x80)
-          *pt++ = (unsigned char)u;  
+          *pt++ = (unsigned char)u;
         else if (u < 0x800) {
           *pt++ = (unsigned char)((u >> 6) | 0xC0);
           *pt++ = (unsigned char)((u & 0x3F) | 0x80);
@@ -2501,7 +2649,7 @@ class diff_match_patch {
         if (++s3 == s2 || (*s3 & 0xC0) != 0x80) continue;
         u += (*s3 & 0x3F) << 6;
         if (++s3 == s2 || (*s3 & 0xC0) != 0x80) continue;
-        u += *s3 & 0x3F; 
+        u += *s3 & 0x3F;
       }
       else {
         ++s3;
